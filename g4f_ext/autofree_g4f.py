@@ -45,6 +45,10 @@ PROVIDER_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_PROVIDER_TIMEOUT", 15))
 # Budget complessivo della catena: oltre questo tempo si restituisce l'errore
 # invece di continuare a provare provider (il client ha comunque un suo timeout).
 TOTAL_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_TOTAL_TIMEOUT", 75))
+# Le richieste con immagine hanno un solo provider utile per volta (quello con
+# la chiave) e l'upload pesa: budget separato, piu' generoso sul singolo hop.
+VISION_PROVIDER_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_VISION_PROVIDER_TIMEOUT", 45))
+VISION_TOTAL_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_VISION_TOTAL_TIMEOUT", 120))
 
 # Alcuni provider "free" rispondono 200 OK con il messaggio di errore come
 # contenuto (rate limit, quota, invito a registrarsi). Senza questo filtro il
@@ -76,8 +80,37 @@ except ImportError:  # nome del modulo non canonico: import esplicito
     from g4f_ext import health as _health  # type: ignore
 
 
+def _has_image(messages, kwargs) -> bool:
+    """Vero se la richiesta contiene un'immagine.
+
+    Un provider text-only non riceve l'immagine e risponde lo stesso: senza
+    questo controllo il client otterrebbe una risposta sicura su un'immagine
+    che nessuno ha visto.
+    """
+    if kwargs.get("image") or kwargs.get("images"):
+        return True
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in (
+                "image_url",
+                "input_image",
+            ):
+                return True
+    return False
+
+
 def _pinned_names() -> List[str]:
     raw = os.environ.get("G4F_AUTOFREE_PROVIDERS", "")
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def _vision_pinned_names() -> List[str]:
+    raw = os.environ.get("G4F_AUTOFREE_VISION_PROVIDERS", "")
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
@@ -86,8 +119,14 @@ def _excluded() -> set:
     return {n.strip() for n in raw.split(",") if n.strip()}
 
 
-def _resolve(names: List[str]) -> List[Type]:
+def _resolve(names: List[str]) -> List[tuple]:
+    """Risolve i nomi in ``(nome, classe)``, saltando esclusioni e sconosciuti.
+
+    Il nome serve a chiedere a health.py il modello giusto per quel provider: la
+    classe da sola non basta, perche' il nome e' la chiave dello stato misurato.
+    """
     resolved, missing, excluded = [], [], _excluded()
+    seen = set()
     for name in names:
         if name in excluded:
             continue
@@ -97,14 +136,60 @@ def _resolve(names: List[str]) -> List[Type]:
             provider = None
         if provider is None:
             missing.append(name)
-        elif getattr(provider, "working", True) and provider not in resolved:
-            resolved.append(provider)
+        elif getattr(provider, "working", True) and provider not in seen:
+            seen.add(provider)
+            resolved.append((name, provider))
     if missing:
         debug.log(f"AutoFree: provider sconosciuti ignorati: {', '.join(missing)}")
     return resolved
 
 
-def _bounded(provider: Type, model_override: str = None, deadline: float = None) -> Type:
+# Attributi che descrivono cosa sa fare il provider: senza copiarli sul wrapper
+# la capability sparisce (era il motivo per cui /v1/models diceva sempre
+# "vision: false" per AutoFree e nessun routing poteva funzionare).
+_PROVIDER_ATTRS = (
+    "label",
+    "url",
+    "working",
+    "needs_auth",
+    "default_model",
+    "default_vision_model",
+    "models",
+    "vision_models",
+    "image_models",
+    "supports_stream",
+    "supports_system_message",
+    "supports_message_history",
+    "supports_native_tools",
+)
+
+
+def _provider_api_key(provider: Type):
+    """Chiave configurata per il provider (env ``<PROVIDER>_API_KEY`` o cookies)."""
+    try:
+        from g4f.tools.auth import AuthManager
+
+        return AuthManager.load_api_key(provider)
+    except Exception:
+        return None
+
+
+def _gate_key():
+    """La nostra chiave (G4F_API_KEY): non e' una credenziale per l'upstream."""
+    try:
+        from g4f.config import AppConfig
+
+        return getattr(AppConfig, "g4f_api_key", None)
+    except Exception:
+        return None
+
+
+def _bounded(
+    provider: Type,
+    model_override: str = None,
+    deadline: float = None,
+    provider_timeout: float = PROVIDER_TIMEOUT,
+) -> Type:
     """Sottoclasse che impone un tetto al tempo prima del primo token.
 
     IterListProvider passa al provider successivo solo se il precedente solleva:
@@ -113,6 +198,15 @@ def _bounded(provider: Type, model_override: str = None, deadline: float = None)
     """
 
     async def _generate(model, messages, stream=True, **kwargs):
+        # Al provider non va la chiave del nostro gateway: il middleware
+        # dell'API la mette in ``config.api_key`` e finirebbe come credenziale
+        # upstream (401). Se il provider ne ha una configurata si usa quella.
+        gate = _gate_key()
+        if gate and kwargs.get("api_key") == gate:
+            kwargs.pop("api_key", None)
+        key = _provider_api_key(provider)
+        if key:
+            kwargs["api_key"] = key
         generator = get_async_provider_method(provider)(
             model=model_override or model,
             messages=messages,
@@ -125,14 +219,23 @@ def _bounded(provider: Type, model_override: str = None, deadline: float = None)
             # Il timeout deve coprire il primo *contenuto*, non il primo chunk:
             # molti provider emettono prima un ProviderInfo e poi restano muti.
             while True:
-                timeout = PROVIDER_TIMEOUT
+                timeout = provider_timeout
                 if deadline is not None:
                     timeout = min(timeout, deadline - loop.time())
                     if timeout <= 0:
                         raise RuntimeError(
                             f"{getattr(provider, '__name__', provider)}: budget catena esaurito"
                         )
-                chunk = await asyncio.wait_for(generator.__anext__(), timeout)
+                try:
+                    chunk = await asyncio.wait_for(generator.__anext__(), timeout)
+                except StopAsyncIteration:
+                    # Provider che chiude senza aver prodotto nulla: senza
+                    # questo, lo StopAsyncIteration uscirebbe dal generatore
+                    # come "async generator raised StopAsyncIteration" e
+                    # nasconderebbe la causa al client.
+                    raise RuntimeError(
+                        f"{getattr(provider, '__name__', provider)}: nessuna risposta"
+                    )
                 if isinstance(chunk, str) and chunk.strip():
                     if _is_poison(chunk):
                         raise RuntimeError(
@@ -152,17 +255,15 @@ def _bounded(provider: Type, model_override: str = None, deadline: float = None)
             except Exception:
                 pass
 
-    return type(
-        getattr(provider, "__name__", "BoundedProvider"),
-        (AsyncGeneratorProvider,),
-        {
-            "create_async_generator": staticmethod(_generate),
-            "label": getattr(provider, "label", None),
-            "url": getattr(provider, "url", None),
-            "working": True,
-            "needs_auth": getattr(provider, "needs_auth", False),
-        },
-    )
+    attrs = {
+        name: getattr(provider, name)
+        for name in _PROVIDER_ATTRS
+        if hasattr(provider, name)
+    }
+    attrs["create_async_generator"] = staticmethod(_generate)
+    attrs["working"] = True
+    attrs["needs_auth"] = getattr(provider, "needs_auth", False)
+    return type(getattr(provider, "__name__", "BoundedProvider"), (AsyncGeneratorProvider,), attrs)
 
 
 class AutoFree(AsyncGeneratorProvider):
@@ -177,7 +278,14 @@ class AutoFree(AsyncGeneratorProvider):
     supports_system_message = True
     supports_message_history = True
     default_model = "gpt-4"
-    models: List[str] = []
+    # L'elenco e' informativo (AutoFree accetta qualsiasi nome), ma serve a
+    # /api/AutoFree/models: senza voci esplicite il mixin lo riduce a
+    # [default_model] e la capability vision non comparirebbe.
+    models: List[str] = ["gpt-4", "gpt-4o"]
+    # AutoFree accetta immagini, ma solo instradandole su un provider che le
+    # vede: dichiararlo qui e' come i client scoprono la capability.
+    default_vision_model = "gpt-4o"
+    vision_models = ["gpt-4o"]
 
     @classmethod
     async def create_async_generator(
@@ -188,26 +296,46 @@ class AutoFree(AsyncGeneratorProvider):
         ignored: list = None,
         **kwargs,
     ):
-        names = _pinned_names() or _health.ordered_names()
+        # Un'immagine non e' un dettaglio del prompt: un provider text-only la
+        # scarta e risponde comunque, quindi la catena va ristretta a chi ha
+        # dimostrato (probe) o dichiarato di vedere. Meglio un errore chiaro di
+        # una risposta inventata.
+        vision = _has_image(messages, kwargs)
+        if vision:
+            names = _vision_pinned_names() or _health.ordered_names(vision=True)
+            provider_timeout = VISION_PROVIDER_TIMEOUT
+            total_timeout = VISION_TOTAL_TIMEOUT
+        else:
+            names = _pinned_names() or _health.ordered_names()
+            provider_timeout = PROVIDER_TIMEOUT
+            total_timeout = TOTAL_TIMEOUT
+
         candidates = _resolve(names)
         if not candidates:
-            raise RuntimeError(
-                "AutoFree: nessun provider disponibile ("
-                + ", ".join(names)
-                + ")"
-            )
-        deadline = asyncio.get_event_loop().time() + TOTAL_TIMEOUT
-        chain = IterListProvider(
-            [
-                _bounded(
-                    p,
-                    _health.preferred_model(getattr(p, "__name__", "")),
-                    deadline,
+            if vision:
+                raise RuntimeError(
+                    "AutoFree: nessun provider con supporto vision disponibile ("
+                    + (", ".join(names) or "catena vuota")
+                    + "). Configura G4F_AUTOFREE_VISION_PROVIDERS o una chiave API "
+                    "(es. GEMINI_API_KEY)."
                 )
-                for p in candidates
-            ],
-            shuffle=False,
-        )
+            raise RuntimeError(
+                "AutoFree: nessun provider disponibile (" + ", ".join(names) + ")"
+            )
+
+        deadline = asyncio.get_event_loop().time() + total_timeout
+        overrides = {}
+        bounded = []
+        for name, provider in candidates:
+            override = (
+                _health.preferred_vision_model(name, model)
+                if vision
+                else _health.preferred_model(name)
+            )
+            overrides[getattr(provider, "__name__", name)] = override
+            bounded.append(_bounded(provider, override, deadline, provider_timeout))
+        chain = IterListProvider(bounded, shuffle=False)
+
         started = time.time()
         async for chunk in chain.create_async_generator(
             model=model,
@@ -218,9 +346,14 @@ class AutoFree(AsyncGeneratorProvider):
         ):
             yield chunk
         # Un successo reale e' il segnale piu' affidabile: aggiorna la classifica
-        # senza aspettare il probe periodico.
+        # senza aspettare il probe periodico. Con un'immagine vale anche come
+        # prova che quel provider la vede davvero.
+        used = getattr(chain.last_provider, "__name__", None)
         _health.record_success(
-            getattr(chain.last_provider, "__name__", None), time.time() - started
+            used,
+            time.time() - started,
+            vision=vision,
+            vision_model=overrides.get(used),
         )
 
 

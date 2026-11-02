@@ -50,6 +50,21 @@ PROBE_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_PROBE_TIMEOUT", 20))
 CONCURRENCY = max(1, int(os.environ.get("G4F_AUTOFREE_PROBE_CONCURRENCY", 3)))
 MAX_CANDIDATES = int(os.environ.get("G4F_AUTOFREE_MAX_CANDIDATES", 24))
 PROBE_MODEL = os.environ.get("G4F_AUTOFREE_PROBE_MODEL", "gpt-4o-mini")
+# --- Vision ---------------------------------------------------------------
+# Una richiesta con immagine data a un provider text-only produce una risposta
+# sicura e sbagliata (l'immagine viene scartata): va quindi misurata come le
+# altre proprieta', con un'immagine vera e una risposta vincolata.
+PROBE_VISION_MODEL = os.environ.get("G4F_AUTOFREE_VISION_MODEL", "gemini-2.5-flash")
+VISION_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_PROBE_VISION_TIMEOUT", 45))
+# 16x16 magenta: il payload piu' piccolo che un modello multimodale accetta.
+VISION_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYElEQVR4nO3PQQ0AIBDAMMC/50MEj4"
+    "ZkVbDtWbN+dnTAqwa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0C2IYAn6MoAmGAAAAAElFTkSuQmCC"
+)
+VISION_PROMPT = "What is the dominant colour of this image? Answer with one word."
+# Risposte accettate: un modello che non vede l'immagine non puo' indovinare
+# un colore cosi' specifico.
+VISION_WORDS = ("magenta", "purple", "pink", "fuchsia", "violet", "viola", "rosa")
 # Oltre questa latenza un provider vivo resta usabile ma passa dietro agli ignoti.
 MAX_LATENCY = float(os.environ.get("G4F_AUTOFREE_MAX_LATENCY", 30))
 # Finestra in cui un successo reale protegge un provider da un probe fallito.
@@ -118,6 +133,83 @@ def _own_model(provider: type) -> str:
     return ""
 
 
+def _vision_key(provider: type) -> Optional[str]:
+    """Chiave API del provider, se ne esiste una configurata."""
+    try:
+        from g4f.tools.auth import AuthManager
+
+        return AuthManager.load_api_key(provider)
+    except Exception:
+        return None
+
+
+def vision_model_map() -> Dict[str, str]:
+    """Modello multimodale per provider: ``Provider=model`` separati da virgola.
+
+    Serve per i provider che non dichiarano ``vision_models`` (le API
+    OpenAI-compatibili espongono solo il catalogo, senza dire quali modelli
+    accettano immagini) e per non dover indovinare: Groq, per esempio, ha un
+    solo modello che vede, ``qwen/qwen3.8-27b``.
+    """
+    raw = os.environ.get("G4F_AUTOFREE_VISION_MODELS", "")
+    mapping: Dict[str, str] = {}
+    for item in raw.split(","):
+        if "=" not in item:
+            continue
+        name, model = item.split("=", 1)
+        if name.strip() and model.strip():
+            mapping[name.strip()] = model.strip()
+    return mapping
+
+
+def declared_vision_model(provider: type) -> Optional[str]:
+    """Modello vision dichiarato dal provider (``default_vision_model`` o lista)."""
+    model = getattr(provider, "default_vision_model", None)
+    if isinstance(model, str) and model:
+        return model
+    for candidate in getattr(provider, "vision_models", None) or []:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def vision_capable(provider: type) -> bool:
+    """Può vedere immagini: lo dichiara, oppure ha una chiave API configurata.
+
+    La chiave conta quanto la dichiarazione: i provider OpenAI-compatibili
+    (Gemini API, Groq, OpenRouter) non dichiarano ``vision_models`` finché il
+    catalogo non è stato scaricato, ma con una chiave funzionano.
+    """
+    if vision_model_map().get(getattr(provider, "__name__", "")):
+        return True
+    return bool(declared_vision_model(provider) or _vision_key(provider))
+
+
+def vision_candidates() -> List[str]:
+    """Provider su cui ha senso provare la vision.
+
+    Più stretto di ``candidates()``: qui interessano anche i provider senza
+    ``default_model`` (catalogo caricato a runtime) se hanno una chiave, mentre
+    un provider text-only non va nemmeno interrogato con un'immagine.
+    """
+    names: List[str] = []
+    for name in ProviderLoader.names:
+        if name == "AutoFree":
+            continue
+        try:
+            provider = ProviderLoader.from_name(name)
+        except Exception:
+            continue
+        if provider is None or not getattr(provider, "working", True):
+            continue
+        if _is_non_chat(provider) or not vision_capable(provider):
+            continue
+        if getattr(provider, "needs_auth", False) and not _vision_key(provider):
+            continue
+        names.append(name)
+    return names
+
+
 def candidates() -> List[str]:
     """Provider che ha senso misurare: chat, senza auth obbligatoria."""
     names: List[str] = []
@@ -184,6 +276,34 @@ async def _ask_ok(provider: type, model: str) -> bool:
     return not any(marker in head for marker in poison)
 
 
+async def _ask_vision(provider: type, model: str) -> Optional[str]:
+    """Chat con un'immagine reale: serve un modello che la veda davvero."""
+    from g4f.client import AsyncClient
+
+    response = await asyncio.wait_for(
+        AsyncClient().chat.completions.create(
+            model=model,
+            provider=provider,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": VISION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": VISION_PNG}},
+                    ],
+                }
+            ],
+            # I modelli multimodali "thinking" consumano il budget in ragionamento
+            # prima di scrivere: con 24 token la risposta e' vuota e il provider
+            # sembrerebbe cieco.
+            max_tokens=512,
+            stream=False,
+        ),
+        VISION_TIMEOUT,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 async def _probe(provider: type) -> Dict[str, Any]:
     """Misura vita e tolleranza al modello generico di un provider.
 
@@ -224,11 +344,38 @@ async def _probe(provider: type) -> Dict[str, Any]:
         except Exception:
             pass
 
+    vision = False
+    vision_model = None
+    vision_latency = None
+    if vision_capable(provider):
+        candidate = (
+            vision_model_map().get(name)
+            or declared_vision_model(provider)
+            or PROBE_VISION_MODEL
+        )
+        started_vision = time.time()
+        try:
+            answer = await _ask_vision(provider, candidate)
+            vision = any(word in (answer or "").lower() for word in VISION_WORDS)
+            if vision:
+                vision_model = candidate
+            else:
+                debug.log(
+                    f"AutoFree health: {name} non vede l'immagine "
+                    f"({(answer or '')[:80]!r})"
+                )
+        except Exception as exc:
+            debug.log(f"AutoFree health: {name} vision fallita: {exc!r}")
+        vision_latency = round(time.time() - started_vision, 1)
+
     return {
         "ok": alive,
         "tolerant": tolerant,
         "latency": round(time.time() - started, 1),
         "model": used_model,
+        "vision": vision,
+        "vision_model": vision_model,
+        "vision_latency": vision_latency,
         "ts": time.time(),
     }
 
@@ -245,7 +392,8 @@ async def probe_all() -> Dict[str, Any]:
                 return
             results[name] = await _probe(provider)
 
-    await asyncio.gather(*(worker(name) for name in candidates()))
+    measured = list(dict.fromkeys(list(candidates()) + vision_candidates()))
+    await asyncio.gather(*(worker(name) for name in measured))
     with _lock:
         for name, fresh in results.items():
             old = dict(_state["providers"].get(name) or {})
@@ -273,9 +421,10 @@ async def probe_all() -> Dict[str, Any]:
     _save()
     ok = sum(1 for r in results.values() if r["ok"])
     tolerant = sum(1 for r in results.values() if r.get("tolerant"))
+    seeing = [n for n, r in results.items() if r.get("vision")]
     debug.log(
         f"AutoFree health: probe completata, {ok}/{len(results)} vivi, "
-        f"{tolerant} tolleranti"
+        f"{tolerant} tolleranti, vision: {', '.join(seeing) or 'nessuno'}"
     )
     return results
 
@@ -312,11 +461,18 @@ def ensure_fresh(force: bool = False) -> None:
     threading.Thread(target=_run_probe, daemon=True, name="autofree-health").start()
 
 
-def record_success(name: Optional[str], latency: Optional[float] = None) -> None:
+def record_success(
+    name: Optional[str],
+    latency: Optional[float] = None,
+    vision: bool = False,
+    vision_model: Optional[str] = None,
+) -> None:
     """Un successo reale vale piu' di un probe: promuove subito il provider.
 
     Se il client ha mandato un modello arbitrario ed e' andata bene, il provider
     e' anche tollerante: e' l'informazione piu' preziosa per l'ordinamento.
+    Con ``vision`` il successo riguarda una richiesta con immagine: il provider
+    ha visto davvero il contenuto, quindi entra subito nella catena vision.
     """
     if not name:
         return
@@ -334,6 +490,11 @@ def record_success(name: Optional[str], latency: Optional[float] = None) -> None
                 "ts": time.time(),
             }
         )
+        if vision:
+            entry["vision"] = True
+            entry["vision_model"] = vision_model or entry.get("vision_model")
+            if latency:
+                entry["vision_latency"] = round(latency, 1)
         _state["providers"][name] = entry
     _save()
 
@@ -352,18 +513,60 @@ def preferred_model(name: str) -> Optional[str]:
     return entry.get("model") or None
 
 
-def ordered_names() -> List[str]:
+def preferred_vision_model(name: str, requested: Optional[str] = None) -> str:
+    """Modello da passare al provider per una richiesta con immagine.
+
+    Il nome chiesto dal client (``gpt-4o``) non e' un modello che un backend
+    gratuito conosce: si usa quello misurato nel probe vision, altrimenti quello
+    dichiarato dal provider, altrimenti ``G4F_AUTOFREE_VISION_MODEL``. Il nome
+    del client si conserva solo se il provider lo espone tra i suoi vision.
+    """
+    entry = (_state.get("providers") or {}).get(name) or {}
+    try:
+        provider = ProviderLoader.from_name(name)
+    except Exception:
+        provider = None
+    if requested and provider is not None:
+        if requested in (getattr(provider, "vision_models", None) or []):
+            return requested
+    # La configurazione esplicita vince sulla misura: se un modello va in 429
+    # (quota giornaliera) si cambia in ``.env`` senza aspettare il probe.
+    return (
+        vision_model_map().get(name)
+        or entry.get("vision_model")
+        or (declared_vision_model(provider) if provider is not None else None)
+        or PROBE_VISION_MODEL
+    )
+
+
+def ordered_names(vision: bool = False) -> List[str]:
     """Candidati ordinati per convenienza reale, non per lista.
 
     * vivi: punteggio = latenza misurata (i non tolleranti ricevono il proprio
       modello, quindi sono comunque utili)
     * vivi ma lentissimi (turnstile): dopo gli ignoti, prima dei falliti
     * ignoti, poi falliti
+
+    Con ``vision=True`` la lista contiene solo i provider che hanno dichiarato
+    o misurato la capacita' di vedere immagini, ordinati per latenza vision.
     """
     ensure_fresh()
     probed = dict(_state.get("providers", {}))
     seed_rank = {name: i for i, name in enumerate(SEED)}
-    names = candidates()
+    names = vision_candidates() if vision else candidates()
+
+    if vision:
+        def vision_key(name: str):
+            entry = probed.get(name) or {}
+            rank = seed_rank.get(name, len(SEED))
+            if entry.get("vision"):
+                latency = float(entry.get("vision_latency") or entry.get("latency") or 999.0)
+                return (0, latency, rank)
+            # Mai misurato (probe in corso o provider appena comparso): vale un
+            # tentativo, ma dopo chi ha già dimostrato di vedere.
+            return (1, 0.0, rank) if not entry else (2, 0.0, rank)
+
+        return sorted(names, key=vision_key)
 
     def key(name: str):
         entry = probed.get(name) or {}

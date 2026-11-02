@@ -96,6 +96,64 @@ Knobs utili in `.env`: `G4F_AUTOFREE_PROVIDERS` (blocca una catena fissa),
 `G4F_AUTOFREE_PROBE_MODEL`.
 Il file di stato si puo' cancellare in qualsiasi momento: viene ricostruito.
 
+## Vision (immagini)
+
+Una richiesta con immagine (`content` a lista con `image_url`, oppure campo
+`image`) **non** usa la catena keyless: i provider gratuiti che rispondono qui
+sono text-only e scarterebbero l'immagine, producendo una risposta sicura e
+sbagliata. AutoFree rileva l'immagine e instrada solo su provider che vedono
+davvero, misurati come tutto il resto (`health.py`, stessa TTL e stesso file di
+stato, con `vision: true/false` e il modello usato).
+
+Se non c'e' nessun provider con vision disponibile la risposta e' un errore
+esplicito (`AutoFree: nessun provider con supporto vision disponibile`), mai una
+risposta inventata.
+
+Configurazione in `.env`:
+
+| variabile | ruolo |
+| --- | --- |
+| `GEMINI_API_KEY` | Google AI Studio, provider `GeminiPro` (consigliata) |
+| `GROQ_API_KEY` | Groq (free tier) |
+| `OPENROUTER_API_KEY` | OpenRouter (`:free`) |
+| `G4F_AUTOFREE_VISION_PROVIDERS` | catena fissa per le immagini, in ordine |
+| `G4F_AUTOFREE_VISION_MODELS` | modello multimodale per provider, `Provider=model` (vince sulla misura) |
+| `G4F_AUTOFREE_VISION_MODEL` | fallback quando il provider non ne dichiara uno |
+| `G4F_AUTOFREE_VISION_PROVIDER_TIMEOUT` | primo contenuto per provider (45s) |
+| `G4F_AUTOFREE_VISION_TOTAL_TIMEOUT` | budget della catena vision (120s) |
+
+Il nome modello chiesto dal client (`gpt-4o`) viene sostituito con quello
+multimodale del provider: `gemini-3.5-flash-lite` per `GeminiPro`,
+`qwen/qwen3.8-27b` per `Groq` (unico modello Groq che accetta immagini sul free
+tier; gli altri rispondono `400 content must be a string`). La chiave del nostro
+gateway non viene mai inoltrata all'upstream: il wrapper usa
+`<PROVIDER>_API_KEY` presa dall'ambiente.
+
+La mappa esplicita vince sulla misura, cosi' un modello finito in quota (429) si
+cambia da `.env` senza aspettare il probe: `gemini-2.5-flash` e' andato in 429
+sulla chiave attuale, `gemini-3.5-flash-lite` risponde.
+
+Misura del 2026-11: `Groq` 0.4-1.3s, `GeminiPro` 1.0-2.6s, entrambi rispondono
+correttamente al colore di un'immagine di test. Catena in `.env`:
+`G4F_AUTOFREE_VISION_PROVIDERS=Groq,GeminiPro`; il failover e' verificato in
+entrambe le direzioni (se il primo risponde 429/503 la richiesta passa al
+secondo senza errori per il client).
+
+Nota: il flag `vision` di `/v1/models` e' sempre `false` per un bug upstream
+(`isinstance(model, VisionModel)` applicato agli id stringa). La capability vera
+si legge su `/api/AutoFree/models`, dove `gpt-4o` risulta `vision: true`.
+
+Verifica rapida:
+
+```sh
+IMG=$(base64 -w0 /percorso/immagine.png)
+curl -s http://blastpi5:1337/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":[
+      {\"type\":\"text\",\"text\":\"Che colore e'?\"},
+      {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$IMG\"}}]}]}"
+```
+
 ## Aggiornamenti
 
 `/usr/local/bin/manage-docker` forza il check dei digest e riavvia la unit solo
