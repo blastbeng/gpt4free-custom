@@ -29,14 +29,21 @@ ordine) e ``G4F_AUTOFREE_EXCLUDE`` (nomi da non usare mai).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
-from typing import List, Type
+from typing import List, Optional, Type
 
 from g4f import debug
 from g4f.Provider import AsyncGeneratorProvider, ProviderLoader, ProviderUtils
 from g4f.providers.base_provider import get_async_provider_method
 from g4f.providers.retry_provider import IterListProvider
+
+# Una riga solo per le richieste con immagine: serve a vedere dal journal quale
+# catena ha servito davvero e se il routing vision e' scattato. Il logger "g4f"
+# sta a ERROR, quindi il livello va alzato qui o la riga sparisce.
+logger = logging.getLogger("g4f.autofree")
+logger.setLevel(logging.INFO)
 
 # Un provider browser-based (turnstile) puo' impiegare 70s+ prima del primo
 # token: oltre questa soglia la catena passa al successivo invece di far
@@ -80,15 +87,30 @@ except ImportError:  # nome del modulo non canonico: import esplicito
     from g4f_ext import health as _health  # type: ignore
 
 
-def _has_image(messages, kwargs) -> bool:
-    """Vero se la richiesta contiene un'immagine.
+_IMAGE_PART_TYPES = ("image_url", "input_image")
 
-    Un provider text-only non riceve l'immagine e risponde lo stesso: senza
-    questo controllo il client otterrebbe una risposta sicura su un'immagine
-    che nessuno ha visto.
+
+def _part_image(part) -> Optional[str]:
+    """URL/data-URI di una parte immagine, se la parte ne contiene una."""
+    if not isinstance(part, dict) or part.get("type") not in _IMAGE_PART_TYPES:
+        return None
+    url = part.get("image_url") or part.get("image")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return url if isinstance(url, str) and url else None
+
+
+def _media_from_messages(messages) -> List[tuple]:
+    """Immagini OpenAI-style -> ``media``, il formato che i provider capiscono.
+
+    L'API inoltra i ``messages`` al provider senza convertirli: una parte
+    ``image_url`` arriva intatta e i provider la trattano come un URL (Groq:
+    ``invalid base64 url``, Gemini: ``Unsupported file URI type: data:...``).
+    ``media`` invece e' il canale gestito da g4f: ``resolve_media`` nel client,
+    ``render_messages`` nei template OpenAI-compatibili, ``inlineData`` in
+    Gemini.
     """
-    if kwargs.get("image") or kwargs.get("images"):
-        return True
+    items: List[tuple] = []
     for message in messages or []:
         if not isinstance(message, dict):
             continue
@@ -96,12 +118,45 @@ def _has_image(messages, kwargs) -> bool:
         if not isinstance(content, list):
             continue
         for part in content:
-            if isinstance(part, dict) and part.get("type") in (
-                "image_url",
-                "input_image",
-            ):
-                return True
-    return False
+            url = _part_image(part)
+            if url:
+                items.append((url, part.get("filename") or part.get("file_name")))
+    return items
+
+
+def _text_only(messages) -> list:
+    """Copia dei ``messages`` senza le parti immagine (i testi restano)."""
+    cleaned = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            cleaned.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list) or not any(_part_image(p) for p in content):
+            cleaned.append(message)
+            continue
+        texts = [
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        cleaned.append({**message, "content": "\n".join(texts) if texts else ""})
+    return cleaned
+
+
+def _has_image(messages, kwargs) -> bool:
+    """Vero se la richiesta contiene un'immagine.
+
+    Un provider text-only non riceve l'immagine e risponde lo stesso: senza
+    questo controllo il client otterrebbe una risposta sicura su un'immagine
+    che nessuno ha visto. Vanno contati tutti i modi in cui l'API accetta
+    immagini, non solo ``image``: il client converte ``image``/``images`` in
+    ``media`` prima di arrivare qui, quindi guardare solo ``image`` mandava le
+    richieste con immagine sulla catena keyless text-only.
+    """
+    if kwargs.get("image") or kwargs.get("images") or kwargs.get("media"):
+        return True
+    return bool(_media_from_messages(messages))
 
 
 def _pinned_names() -> List[str]:
@@ -301,6 +356,19 @@ class AutoFree(AsyncGeneratorProvider):
         # dimostrato (probe) o dichiarato di vedere. Meglio un errore chiaro di
         # una risposta inventata.
         vision = _has_image(messages, kwargs)
+        # Le immagini vanno spostate su ``media`` prima di scegliere il
+        # provider: i messaggi OpenAI-style non vengono convertiti da nessuno e
+        # i provider li rifiutano (400) invece di vedere l'immagine.
+        media = _media_from_messages(messages)
+        if media:
+            existing = kwargs.get("media")
+            if isinstance(existing, str):
+                existing = [(existing, None)]
+            merged = list(existing or [])
+            seen = {item[0] for item in merged if isinstance(item, (list, tuple))}
+            merged += [item for item in media if item[0] not in seen]
+            kwargs["media"] = merged
+            messages = _text_only(messages)
         if vision:
             names = _vision_pinned_names() or _health.ordered_names(vision=True)
             provider_timeout = VISION_PROVIDER_TIMEOUT
@@ -309,6 +377,12 @@ class AutoFree(AsyncGeneratorProvider):
             names = _pinned_names() or _health.ordered_names()
             provider_timeout = PROVIDER_TIMEOUT
             total_timeout = TOTAL_TIMEOUT
+        if vision:
+            logger.info(
+                "AutoFree: richiesta con immagine (media=%d) -> catena: %s",
+                len(kwargs.get("media") or []),
+                ", ".join(names) or "vuota",
+            )
 
         candidates = _resolve(names)
         if not candidates:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -87,7 +88,16 @@ _MEDIA_SUFFIXES = ("image", "images", "audio", "tts", "voice", "video")
 
 _lock = threading.Lock()
 _probing = False
+# Quando e' partito il probe in corso: un worker che resta appeso (provider che
+# non risponde alla cancellazione) lascerebbe _probing a True per sempre, e da
+# li' in poi nessun probe nuovo, con lo stato fermo a quello vecchio. Il
+# watchdog in ensure_fresh() lo considera morto dopo PROBE_WATCHDOG secondi.
+_probe_started = 0.0
+PROBE_WATCHDOG = float(os.environ.get("G4F_AUTOFREE_PROBE_WATCHDOG", 900))
 _state: Dict[str, Any] = {"providers": {}, "updated": 0.0}
+
+logger = logging.getLogger("g4f.autofree")
+logger.setLevel(logging.INFO)
 
 
 def load() -> None:
@@ -440,11 +450,19 @@ async def probe_all() -> Dict[str, Any]:
         f"AutoFree health: probe completata, {ok}/{len(results)} vivi, "
         f"{tolerant} tolleranti, vision: {', '.join(seeing) or 'nessuno'}"
     )
+    logger.info(
+        "AutoFree health: probe completata, %d/%d vivi, %d tolleranti, vision: %s",
+        ok,
+        len(results),
+        tolerant,
+        ", ".join(seeing) or "nessuno",
+    )
     return results
 
 
 def _run_probe() -> None:
-    global _probing
+    global _probing, _probe_started
+    logger.info("AutoFree health: probe avviata")
     try:
         # Il thread di probe e' un contesto nuovo rispetto al boot del server:
         # senza questo, i provider che usano CDP non vedrebbero
@@ -459,19 +477,31 @@ def _run_probe() -> None:
         asyncio.run(probe_all())
     except Exception as exc:
         debug.log(f"AutoFree health: probe fallita ({exc!r})")
+        logger.warning("AutoFree health: probe fallita (%r)", exc)
     finally:
         with _lock:
             _probing = False
+            _probe_started = 0.0
 
 
 def ensure_fresh(force: bool = False) -> None:
     """Avvia il probe in background se lo stato e' scaduto (mai bloccante)."""
-    global _probing
+    global _probing, _probe_started
     with _lock:
-        stale = force or (time.time() - float(_state.get("updated") or 0)) > TTL
+        now = time.time()
+        if _probing and _probe_started and now - _probe_started > PROBE_WATCHDOG:
+            logger.warning(
+                "AutoFree health: probe ferma da %ds (> %ds), la considero morta",
+                int(now - _probe_started),
+                int(PROBE_WATCHDOG),
+            )
+            _probing = False
+            _probe_started = 0.0
+        stale = force or (now - float(_state.get("updated") or 0)) > TTL
         if _probing or not stale:
             return
         _probing = True
+        _probe_started = now
     threading.Thread(target=_run_probe, daemon=True, name="autofree-health").start()
 
 

@@ -147,7 +147,9 @@ Knobs utili in `.env`: `G4F_AUTOFREE_PROVIDERS` (blocca una catena fissa),
 `G4F_AUTOFREE_EXCLUDE` (nomi mai usati, **ne' dalla catena ne' dal probe**:
 un tentativo su un provider browser-based costa una tab, cioe' un renderer),
 `G4F_AUTOFREE_TTL_SECONDS`,
-`G4F_AUTOFREE_PROVIDER_TIMEOUT` (primo contenuto, default 15s),
+`G4F_AUTOFREE_PROVIDER_TIMEOUT` (primo contenuto; in `.env` e' 25s, perche' con
+il default di 15s Cloudflare — 13-18s — veniva tagliato e il circuito lo metteva
+in cooldown lasciando la catena senza provider utile),
 `G4F_AUTOFREE_TOTAL_TIMEOUT` (budget catena, default 75s),
 `G4F_AUTOFREE_PROBE_MODEL`.
 Il file di stato si puo' cancellare in qualsiasi momento: viene ricostruito.
@@ -164,6 +166,40 @@ stato, con `vision: true/false` e il modello usato).
 Se non c'e' nessun provider con vision disponibile la risposta e' un errore
 esplicito (`AutoFree: nessun provider con supporto vision disponibile`), mai una
 risposta inventata.
+
+### Forme accettate (tutte e tre verificate)
+
+```jsonc
+// 1) campo "image" (data URI)
+{"model":"gpt-4o","messages":[{"role":"user","content":"Che colore?"}],
+ "image":"data:image/png;base64,...."}
+
+// 2) campo "media" (data URI + nome file)
+{"model":"gpt-4o","messages":[{"role":"user","content":"Che colore?"}],
+ "media":[["data:image/png;base64,....","x.png"]]}
+
+// 3) OpenAI-style: content a lista con image_url (quello che manda un client
+//    OpenAI generico, es. LangChain, openai-python)
+{"model":"gpt-4o","messages":[{"role":"user","content":[
+  {"type":"text","text":"Che colore?"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,...."}}]}]}
+```
+
+La forma 3 non funzionava: l'API inoltra i `messages` al provider senza
+convertirli, quindi la parte `image_url` arrivava intatta e i provider la
+trattavano come un URL (`Groq: invalid base64 url`, `Gemini: Unsupported file
+URI type: data:...`), mentre l'immagine vera non veniva mai vista. Inoltre il
+routing vision guardava solo il kwarg `image`, ma il client converte
+`image`/`images` in `media` prima di arrivare ad AutoFree: le richieste con
+immagine finivano sulla catena keyless text-only. Ora `autofree_g4f.py`:
+
+* riconosce l'immagine in tutti e tre i casi (`image`, `images`, `media`,
+  parti `image_url`/`input_image`);
+* sposta le parti immagine su `media`, il canale che i provider implementano
+  davvero (`resolve_media` nel client, `render_messages` nei template
+  OpenAI-compatibili, `inlineData` in Gemini), lasciando i testi nei messaggi;
+* scrive una riga di log per richiesta con immagine
+  (`AutoFree: richiesta con immagine (media=1) -> catena: Groq, GeminiPro`).
 
 Configurazione in `.env`:
 
