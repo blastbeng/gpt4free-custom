@@ -1,0 +1,119 @@
+services:
+  gpt4free:
+    # Immagine upstream "slim": API-only, multi-arch (arm64 verificato sul Pi5).
+    # L'aggiornamento e' gestito da /usr/local/bin/manage-docker, che forza il
+    # check del digest sul registry e riavvia la unit solo se l'immagine cambia:
+    # per questo va referenziata per TAG (non per digest) e con pull_policy
+    # if_not_present, come il resto degli stack.
+    image: ${G4F_IMAGE:-hlohaus789/g4f:latest-slim}
+    pull_policy: if_not_present
+    container_name: gpt4free
+    # Lifecycle interamente in mano a systemd (docker-compose@.service):
+    # il container non deve riavviarsi da solo o il compose non esce mai.
+    restart: no
+    init: true
+    # Nessuna lista statica di provider: l'ordine dei candidati arriva da
+    # g4f_ext/health.py, che li misura in background e salva l'esito in
+    # data/g4f/autofree_health.json (TTL 6h). Chi smette di funzionare scende
+    # in fondo da solo, chi torna a funzionare risale.
+    command: ["python3", "-m", "g4f", "--port", "8080", "--no-gui"]
+    ports:
+      # Solo rete locale: http://blastpi5:1337/v1
+      - "${G4F_PORT:-1337}:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Il container ascolta SEMPRE su 8080: la porta host arriva da ports:.
+      G4F_CONFIG_DIR: /data/g4f
+      PYTHONUNBUFFERED: "1"
+      # Provider composito registrato da /ext (vedi g4f_ext/): nessun provider
+      # scelto a mano, failover automatico con circuit breaker di g4f.
+      # Sovrascrivibile da .env per tornare a un provider singolo.
+      G4F_PROVIDER: ${G4F_PROVIDER:-AutoFree}
+      # Browser esterno (servizio chromium qui sotto) per i provider che
+      # richiedono JS/turnstile: g4f si collega via CDP, non ne avvia uno suo.
+      # IP letterale, non il nome del servizio: il server HTTP DevTools di
+      # Chrome rifiuta con 500 un header Host che non sia un IP (o localhost).
+      G4F_BROWSER_HOST: ${G4F_BROWSER_HOST:-172.31.0.10}
+      G4F_BROWSER_PORT: ${G4F_BROWSER_PORT:-9222}
+      G4F_BROWSER_HEADLESS: "true"
+      # sitecustomize.py in /ext registra AutoFree all'avvio dell'interprete.
+      PYTHONPATH: /ext
+      # glibc crea un'arena per thread: su 8GB condivisi con altri stack la
+      # frammentazione e' la prima causa di OOM. Due arene bastano.
+      MALLOC_ARENA_MAX: "2"
+      TZ: ${TZ:-Europe/Rome}
+    volumes:
+      # Cookie/HAR/cache: sopravvivono ai restart e non finiscono nell'immagine.
+      - ./data/g4f:/data/g4f
+      - ./data/generated_media:/app/generated_media
+      - ./data/har_and_cookies:/app/har_and_cookies
+      # Estensione locale (provider AutoFree): codice nostro, immagine intatta.
+      - ./g4f_ext:/ext:ro
+    depends_on:
+      - chromium
+    networks:
+      - default
+      - browser
+    # g4f non espone /health: /v1/models e' la probe piu' economica che passa
+    # dal middleware di autenticazione (quindi verifica anche la chiave) e
+    # restituisce il catalogo modelli. Con G4F_API_KEY impostata ogni route
+    # richiede l'header, per questo la chiave viene passata qui.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -fsS -m 8 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/models | grep -q "\"data\""'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # RAM del Pi5 e' contesa (altri stack + swap gia' usato): tetto esplicito.
+    mem_limit: 1200m
+    memswap_limit: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # Chromium headless per i provider di g4f che richiedono un browser vero
+  # (turnstile/JS: Cloudflare, DeepInfra, ...). Immagine multi-arch, arm64
+  # verificato. Non espone porte: g4f ci parla via CDP sulla rete del progetto.
+  chromium:
+    image: ${CHROMIUM_IMAGE:-chromedp/headless-shell:latest}
+    pull_policy: if_not_present
+    container_name: gpt4free-chromium
+    restart: no
+    init: true
+    shm_size: 256m
+    environment:
+      TZ: ${TZ:-Europe/Rome}
+    # run.sh dell'immagine: socat TCP4 9222 -> Chromium 127.0.0.1:9223.
+    # L'immagine non ha curl/wget, quindi la probe usa il /dev/tcp di bash.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9222 && exec 3<&-"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Tetto basso: Chromium e' un servizio di supporto, non deve mai essere
+    # la ragione per cui l'API viene OOM-killed.
+    mem_limit: 640m
+    memswap_limit: 896m
+    networks:
+      browser:
+        ipv4_address: 172.31.0.10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+# Rete dedicata al browser: subnet fissa perche' g4f deve raggiungere Chromium
+# tramite IP letterale (vedi G4F_BROWSER_HOST) e non via nome DNS.
+networks:
+  browser:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
