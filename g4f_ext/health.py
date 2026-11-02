@@ -113,6 +113,18 @@ def _save() -> None:
         debug.log(f"AutoFree health: salvataggio stato fallito ({exc!r})")
 
 
+def _excluded() -> set:
+    """Nomi esclusi a mano (``G4F_AUTOFREE_EXCLUDE``).
+
+    Vale anche per il probe, non solo per la catena: un provider browser-based
+    che non risponde piu' costa una tab e un renderer a ogni misura, e con 24
+    candidati x 2 domande bastava a saturare Chromium (121 renderer, OOM loop
+    del 2026-11-02). Chi e' escluso qui non viene nemmeno misurato.
+    """
+    raw = os.environ.get("G4F_AUTOFREE_EXCLUDE", "")
+    return {n.strip() for n in raw.split(",") if n.strip()}
+
+
 def _is_non_chat(provider: type) -> bool:
     name = getattr(provider, "__name__", "")
     module = getattr(provider, "__module__", "").lower()
@@ -193,8 +205,9 @@ def vision_candidates() -> List[str]:
     un provider text-only non va nemmeno interrogato con un'immagine.
     """
     names: List[str] = []
+    excluded = _excluded()
     for name in ProviderLoader.names:
-        if name == "AutoFree":
+        if name == "AutoFree" or name in excluded:
             continue
         try:
             provider = ProviderLoader.from_name(name)
@@ -213,8 +226,9 @@ def vision_candidates() -> List[str]:
 def candidates() -> List[str]:
     """Provider che ha senso misurare: chat, senza auth obbligatoria."""
     names: List[str] = []
+    excluded = _excluded()
     for name in ProviderLoader.names:
-        if name == "AutoFree":
+        if name == "AutoFree" or name in excluded:
             continue
         try:
             provider = ProviderLoader.from_name(name)

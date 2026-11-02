@@ -1,0 +1,15 @@
+[Unit]
+# Ogni 5 minuti: il reaper legge il cgroup del browser e, se serve, riavvia
+# docker-compose@gpt4free (gestisce anche il rate-limit dei riavvii).
+Description=Reaper del browser di gpt4free, ogni 5 minuti
+
+[Timer]
+# Dopo il boot l'avvio dello stack puo' durare ~2 minuti (start_period 120s):
+# non misurare prima che i container siano su.
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=gpt4free-chromium-reaper.service
+
+[Install]
+WantedBy=timers.target

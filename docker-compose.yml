@@ -90,6 +90,27 @@ services:
     restart: no
     init: true
     shm_size: 256m
+    # Flag passati a headless-shell: run.sh li accoda ai suoi (lo script termina
+    # con "$@"). Sono la difesa vera contro l'OOM misurato il 2026-11-02:
+    #   * --disable-gpu: run.sh forza --use-gl=angle --use-angle=swiftshader,
+    #     il processo GPU veniva ucciso dal cgroup e i renderer restavano in un
+    #     loop di "ContextResult::kTransientFailure" (CPU 180% con 121 renderer);
+    #   * --renderer-process-limit: senza tetto ogni tab dei provider apriva un
+    #     renderer nuovo (121 vivi, 110 OOM-kill in 28 minuti); Chrome riusa i
+    #     processi esistenti invece di crearne altri;
+    #   * --js-flags: tetto all'heap V8 di ogni renderer;
+    #   * --disable-dev-shm-usage: i 256m di /dev/shm non bastano come area di
+    #     scambio dei renderer sotto carico.
+    command:
+      - --disable-gpu
+      - --disable-software-rasterizer
+      - --renderer-process-limit=4
+      - --js-flags=--max-old-space-size=128
+      - --disable-dev-shm-usage
+      - --disable-crash-reporter
+      - --disable-background-networking
+      - --no-first-run
+      - --no-default-browser-check
     environment:
       TZ: ${TZ:-Europe/Rome}
     # run.sh dell'immagine: socat TCP4 9222 -> Chromium 127.0.0.1:9223.

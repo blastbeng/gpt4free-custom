@@ -47,10 +47,64 @@ catena (Yqcloud accetta nomi arbitrari).
 
 ## Healthcheck
 
-1. `gpt4free`: `curl /v1/models` con chiave (30s, 3 retry, start_period 120s).
-2. `chromium`: `bash` su `/dev/tcp/127.0.0.1/9222` (l'immagine non ha curl).
+1. `gpt4free`: `curl /v1/providers` con chiave (30s, 3 retry, start_period
+   120s). Non `/v1/models`: a cache fredda interroga gli upstream e puo'
+   impiegare 9-20s, segnando unhealthy un container che risponde.
+2. `chromium`: `bash` su `/dev/tcp/127.0.0.1/9222` con una vera GET
+   `/json/version` (l'immagine non ha curl): la sola connessione TCP non basta,
+   un Chromium saturo accetta il socket e poi non risponde.
 3. `scripts/selftest.sh`: chat reale su piu' modelli, log only, non riavvia
    nulla (i compose attivi sono gia' controllati dal cron di sistema).
+
+## Chromium: perche' e' limitato e cosa lo tiene in riga
+
+Chromium qui e' un servizio di supporto (turnstile/JS per Cloudflare e simili),
+ma e' anche l'unico componente che puo' far cadere tutto lo stack: se si satura,
+g4f resta bloccato dentro una richiesta CDP e non chiude piu' le tab; ogni tab
+resta un renderer, e il memcg comincia a ucciderli mentre Chrome li ricrea.
+
+Misura del 2026-11-02, prima della correzione: 1024MiB/1GiB, swap saturo,
+**121 renderer**, **110 OOM-kill in 28 minuti**, CPU 180%, `/v1/providers` in
+timeout a 20s, load 18. Portare `mem_limit` da 640m a 1g non aveva risolto
+nulla: le kill erano aumentate, perche' su Pi5 lo swap e' zram (RAM reale), non
+disco. Aggiungere memoria non e' la leva.
+
+Due difese, entrambe necessarie:
+
+1. **Flag al browser** (`command:` del servizio chromium): `--disable-gpu`
+   (il `run.sh` dell'immagine forza `--use-angle=swiftshader`: il processo GPU
+   veniva ucciso e i renderer restavano in loop su
+   `ContextResult::kTransientFailure`), `--renderer-process-limit=4` (Chrome
+   riusa i renderer invece di crearne uno per tab), `--js-flags=`
+   `--max-old-space-size=128`, `--disable-dev-shm-usage`.
+2. **Reaper** (`scripts/chromium-reaper.sh`, timer
+   `gpt4free-chromium-reaper.timer`, ogni 5 minuti): legge solo il cgroup del
+   container (`memory.current` contro `memory.max`, `oom_kill` in
+   `memory.events`) e, oltre il 90% o con 3 renderer uccisi fra due giri,
+   riavvia `docker-compose@gpt4free`. Riavvia la **unit** e non il container
+   perche' il compose gira con `--abort-on-container-exit`: fermare chromium
+   farebbe comunque cadere lo stack, ma senza il controllo di systemd. Rate
+   limit 20 minuti, stato in `/run/gpt4free-chromium-reaper.state`; soglie
+   `REAPER_MEM_PCT`, `REAPER_OOM_DELTA`, `REAPER_MIN_INTERVAL`.
+
+La latenza di un reaper che sbaglia e' un riavvio di troppo: `--dry-run` misura
+e stampa la decisione senza toccare nulla.
+
+Mai `ps aux | grep chromium`: su questa macchina conta i chromium degli altri
+stack. Il cgroup si trova con `docker inspect -f '{{.Id}}'` e
+`find /sys/fs/cgroup -name "docker-<id>.scope"`.
+
+Installazione (una volta, come root):
+
+```sh
+sudo cp systemd/gpt4free-chromium-reaper.service \
+        systemd/gpt4free-chromium-reaper.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gpt4free-chromium-reaper.timer
+```
+
+Dopo la correzione, stessa macchina: 245-350MiB stabili, 1 renderer, CPU ~0%,
+`oom_kill` fermo a 0, `/v1/providers` in 34ms.
 
 ## Stato dei provider: si misura da solo
 
@@ -90,7 +144,9 @@ Due difese che non dipendono dal probe:
   servono da riserva utile. Al client si presenta il nome modello richiesto.
 
 Knobs utili in `.env`: `G4F_AUTOFREE_PROVIDERS` (blocca una catena fissa),
-`G4F_AUTOFREE_EXCLUDE` (nomi mai usati), `G4F_AUTOFREE_TTL_SECONDS`,
+`G4F_AUTOFREE_EXCLUDE` (nomi mai usati, **ne' dalla catena ne' dal probe**:
+un tentativo su un provider browser-based costa una tab, cioe' un renderer),
+`G4F_AUTOFREE_TTL_SECONDS`,
 `G4F_AUTOFREE_PROVIDER_TIMEOUT` (primo contenuto, default 15s),
 `G4F_AUTOFREE_TOTAL_TIMEOUT` (budget catena, default 75s),
 `G4F_AUTOFREE_PROBE_MODEL`.

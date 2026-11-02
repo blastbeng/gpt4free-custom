@@ -1,0 +1,15 @@
+[Unit]
+# Reaper del browser di gpt4free: riavvia lo stack quando il cgroup di
+# gpt4free-chromium satura la memoria o comincia a uccidere renderer.
+# Vedi scripts/chromium-reaper.sh per il perche' e le soglie.
+Description=Reaper del browser di gpt4free (cgroup di gpt4free-chromium)
+Documentation=file:/opt/docker/compose/gpt4free/scripts/chromium-reaper.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/docker/compose/gpt4free/scripts/chromium-reaper.sh
+# Un riavvio dello stack dura minuti: oltre questo il timer salta un giro,
+# non accumula esecuzioni.
+TimeoutStartSec=15min
