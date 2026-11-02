@@ -56,19 +56,19 @@ services:
     networks:
       - default
       - browser
-    # g4f non espone /health: /v1/models e' la probe piu' economica che passa
-    # dal middleware di autenticazione (quindi verifica anche la chiave) e
-    # restituisce il catalogo modelli. Con G4F_API_KEY impostata ogni route
-    # richiede l'header, per questo la chiave viene passata qui.
+    # g4f non espone /health. La probe deve restare locale ed economica:
+    # /v1/providers elenca i provider registrati (~40 ms) e passa dal middleware
+    # di autenticazione, quindi verifica sia la chiave sia la registrazione di
+    # AutoFree: senza AutoFree ogni chat fallirebbe con "Provider not found".
+    # /v1/models non e' adatta a una healthcheck: a cache fredda interroga i
+    # provider upstream (misurati 9-20 s) e il solo budget della probe puo'
+    # superare il timeout, segnando unhealthy un container che risponde.
     healthcheck:
-      # Due asserzioni, non una: se un aggiornamento upstream rompe la
-      # registrazione di AutoFree, /v1/models continuerebbe a rispondere (verde)
-      # mentre ogni chat fallirebbe con "Provider not found: AutoFree".
       test:
         - CMD-SHELL
-        - 'curl -fsS -m 10 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/models | grep -q "\"data\"" && curl -fsS -m 10 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/providers | grep -q "AutoFree"'
+        - 'curl -fsS -m 15 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/providers | grep -q "AutoFree"'
       interval: 30s
-      timeout: 10s
+      timeout: 20s
       retries: 3
       start_period: 120s
     # RAM del Pi5 e' contesa (altri stack + swap gia' usato): tetto esplicito.
@@ -93,17 +93,30 @@ services:
     environment:
       TZ: ${TZ:-Europe/Rome}
     # run.sh dell'immagine: socat TCP4 9222 -> Chromium 127.0.0.1:9223.
-    # L'immagine non ha curl/wget, quindi la probe usa il /dev/tcp di bash.
+    # L'immagine non ha curl/wget, quindi la probe parla HTTP a mano sul
+    # /dev/tcp di bash. Non basta la sola connessione TCP: un Chromium saturo
+    # (mem_limit raggiunto) accetta il socket e poi non risponde piu', e g4f
+    # resta bloccato dentro la sua richiesta CDP bloccando l'intero event loop.
+    # Serve quindi una risposta vera dal server DevTools.
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9222 && exec 3<&-"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/9222 && printf "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3 && read -t 5 -r line <&3 && case "$$line" in "HTTP/1."*" 200"*) exit 0;; *) exit 1;; esac'
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
       start_period: 20s
-    # Tetto basso: Chromium e' un servizio di supporto, non deve mai essere
-    # la ragione per cui l'API viene OOM-killed.
-    mem_limit: 640m
-    memswap_limit: 896m
+    # Chromium e' un servizio di supporto e non deve mai essere la ragione per
+    # cui l'API viene OOM-killed, ma 640m si sono dimostrati insufficienti: i
+    # provider che aprono una tab per tentativo (Cloudflare, ChatGPT, Copilot,
+    # Qwen, DeepInfra) arrivano a decine di renderer e il cgroup uccideva
+    # headless-shell in pochi minuti, facendo cadere tutto lo stack
+    # (--abort-on-container-exit). 1g lascia margine alle tab; i 256m di swap
+    # assorbono i picchi senza regalare RAM al browser.
+    mem_limit: 1g
+    memswap_limit: 1280m
     networks:
       browser:
         ipv4_address: 172.31.0.10
