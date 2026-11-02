@@ -61,9 +61,12 @@ services:
     # restituisce il catalogo modelli. Con G4F_API_KEY impostata ogni route
     # richiede l'header, per questo la chiave viene passata qui.
     healthcheck:
+      # Due asserzioni, non una: se un aggiornamento upstream rompe la
+      # registrazione di AutoFree, /v1/models continuerebbe a rispondere (verde)
+      # mentre ogni chat fallirebbe con "Provider not found: AutoFree".
       test:
         - CMD-SHELL
-        - 'curl -fsS -m 8 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/models | grep -q "\"data\""'
+        - 'curl -fsS -m 10 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/models | grep -q "\"data\"" && curl -fsS -m 10 -H "g4f-api-key: $$G4F_API_KEY" http://127.0.0.1:8080/v1/providers | grep -q "AutoFree"'
       interval: 30s
       timeout: 10s
       retries: 3
