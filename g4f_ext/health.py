@@ -157,6 +157,33 @@ async def _ask(provider: type, model: str) -> Optional[str]:
     return (response.choices[0].message.content or "").strip()
 
 
+async def _ask_ok(provider: type, model: str) -> bool:
+    """Vero solo se il provider risponde con contenuto *utile*.
+
+    Un 200 con "rate limit"/"sign up" come contenuto non e' un successo: senza
+    questo controllo il probe promuoverebbe provider che non servono nulla.
+    """
+    content = await _ask(provider, model)
+    if not content:
+        return False
+    head = content[:200].lower()
+    poison = (
+        "请求过多",
+        "限流",
+        "rate limit",
+        "too many requests",
+        "sign up",
+        "iscriviti",
+        "registrati",
+        "suscript",
+        "insufficient quota",
+        "quota exceeded",
+        "no cake credits",
+        "temporarily unavailable",
+    )
+    return not any(marker in head for marker in poison)
+
+
 async def _probe(provider: type) -> Dict[str, Any]:
     """Misura vita e tolleranza al modello generico di un provider.
 
@@ -172,7 +199,7 @@ async def _probe(provider: type) -> Dict[str, Any]:
     used_model = own_model
 
     try:
-        if await _ask(provider, PROBE_MODEL):
+        if await _ask_ok(provider, PROBE_MODEL):
             tolerant = alive = True
             used_model = PROBE_MODEL
     except Exception as exc:
@@ -180,7 +207,7 @@ async def _probe(provider: type) -> Dict[str, Any]:
 
     if not alive and own_model and own_model != PROBE_MODEL:
         try:
-            if await _ask(provider, own_model):
+            if await _ask_ok(provider, own_model):
                 alive = True
                 used_model = own_model
         except Exception as exc:
@@ -191,7 +218,7 @@ async def _probe(provider: type) -> Dict[str, Any]:
         # un secondo tentativo, un attimo dopo, prima di dichiararlo guasto.
         await asyncio.sleep(3)
         try:
-            if await _ask(provider, PROBE_MODEL):
+            if await _ask_ok(provider, PROBE_MODEL):
                 tolerant = alive = True
                 used_model = PROBE_MODEL
         except Exception:
@@ -311,11 +338,25 @@ def record_success(name: Optional[str], latency: Optional[float] = None) -> None
     _save()
 
 
+def preferred_model(name: str) -> Optional[str]:
+    """Modello da usare con questo provider.
+
+    ``None`` = passa quello chiesto dal client (provider tollerante).
+    Altrimenti il modello su cui il provider ha risposto nel probe: cosi' anche
+    i provider legati al proprio catalogo servono da riserva utile invece di
+    fallire su ogni modello "straniero".
+    """
+    entry = (_state.get("providers") or {}).get(name) or {}
+    if entry.get("tolerant"):
+        return None
+    return entry.get("model") or None
+
+
 def ordered_names() -> List[str]:
     """Candidati ordinati per convenienza reale, non per lista.
 
-    * vivi e tolleranti al modello generico: punteggio = latenza * 0.6
-    * vivi ma legati al proprio catalogo: punteggio = latenza
+    * vivi: punteggio = latenza misurata (i non tolleranti ricevono il proprio
+      modello, quindi sono comunque utili)
     * vivi ma lentissimi (turnstile): dopo gli ignoti, prima dei falliti
     * ignoti, poi falliti
     """
@@ -328,7 +369,13 @@ def ordered_names() -> List[str]:
         entry = probed.get(name) or {}
         latency = float(entry.get("latency") or 999.0)
         rank = seed_rank.get(name, len(SEED))
-        score = latency * (0.6 if entry.get("tolerant") else 1.0)
+        # La tolleranza non e' piu' decisiva: ai provider legati al proprio
+        # catalogo passiamo il loro modello (preferred_model). Conta la latenza,
+        # con un bonus a chi ha appena servito una richiesta vera: "sticky" sui
+        # provider che funzionano davvero riduce la varianza dei tempi.
+        score = latency
+        if entry.get("real") and (time.time() - float(entry.get("ts") or 0)) < REAL_GRACE:
+            score *= 0.5
         if entry.get("tolerant") or entry.get("ok"):
             # Anche un provider tollerante ma lentissimo (turnstile da 70s)
             # non deve stare davanti a uno piu' rapido.

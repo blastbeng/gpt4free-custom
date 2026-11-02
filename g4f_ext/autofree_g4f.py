@@ -41,7 +41,34 @@ from g4f.providers.retry_provider import IterListProvider
 # Un provider browser-based (turnstile) puo' impiegare 70s+ prima del primo
 # token: oltre questa soglia la catena passa al successivo invece di far
 # aspettare il client.
-PROVIDER_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_PROVIDER_TIMEOUT", 25))
+PROVIDER_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_PROVIDER_TIMEOUT", 15))
+# Budget complessivo della catena: oltre questo tempo si restituisce l'errore
+# invece di continuare a provare provider (il client ha comunque un suo timeout).
+TOTAL_TIMEOUT = float(os.environ.get("G4F_AUTOFREE_TOTAL_TIMEOUT", 75))
+
+# Alcuni provider "free" rispondono 200 OK con il messaggio di errore come
+# contenuto (rate limit, quota, invito a registrarsi). Senza questo filtro il
+# failover non scatta e il client riceve quel testo come risposta.
+_POISON = (
+    "请求过多",          # rate limit (zh-CN)
+    "限流",
+    "充值",
+    "rate limit",
+    "too many requests",
+    "sign up",
+    "iscriviti",        # "Sign up and repeat your request" (it)
+    "registrati",
+    "suscript",
+    "insufficient quota",
+    "quota exceeded",
+    "no cake credits",
+    "temporarily unavailable",
+)
+
+
+def _is_poison(text: str) -> bool:
+    head = (text or "")[:200].lower()
+    return any(marker in head for marker in _POISON)
 
 try:
     import health as _health
@@ -77,7 +104,7 @@ def _resolve(names: List[str]) -> List[Type]:
     return resolved
 
 
-def _bounded(provider: Type) -> Type:
+def _bounded(provider: Type, model_override: str = None, deadline: float = None) -> Type:
     """Sottoclasse che impone un tetto al tempo prima del primo token.
 
     IterListProvider passa al provider successivo solo se il precedente solleva:
@@ -87,11 +114,36 @@ def _bounded(provider: Type) -> Type:
 
     async def _generate(model, messages, stream=True, **kwargs):
         generator = get_async_provider_method(provider)(
-            model=model, messages=messages, stream=stream, **kwargs
+            model=model_override or model,
+            messages=messages,
+            stream=stream,
+            **kwargs,
         )
+        loop = asyncio.get_event_loop()
+        pending = []
         try:
-            first = await asyncio.wait_for(generator.__anext__(), PROVIDER_TIMEOUT)
-            yield first
+            # Il timeout deve coprire il primo *contenuto*, non il primo chunk:
+            # molti provider emettono prima un ProviderInfo e poi restano muti.
+            while True:
+                timeout = PROVIDER_TIMEOUT
+                if deadline is not None:
+                    timeout = min(timeout, deadline - loop.time())
+                    if timeout <= 0:
+                        raise RuntimeError(
+                            f"{getattr(provider, '__name__', provider)}: budget catena esaurito"
+                        )
+                chunk = await asyncio.wait_for(generator.__anext__(), timeout)
+                if isinstance(chunk, str) and chunk.strip():
+                    if _is_poison(chunk):
+                        raise RuntimeError(
+                            f"{getattr(provider, '__name__', provider)}: risposta di "
+                            "errore travestita da contenuto"
+                        )
+                    for buffered in pending:
+                        yield buffered
+                    yield chunk
+                    break
+                pending.append(chunk)
             async for chunk in generator:
                 yield chunk
         finally:
@@ -144,7 +196,18 @@ class AutoFree(AsyncGeneratorProvider):
                 + ", ".join(names)
                 + ")"
             )
-        chain = IterListProvider([_bounded(p) for p in candidates], shuffle=False)
+        deadline = asyncio.get_event_loop().time() + TOTAL_TIMEOUT
+        chain = IterListProvider(
+            [
+                _bounded(
+                    p,
+                    _health.preferred_model(getattr(p, "__name__", "")),
+                    deadline,
+                )
+                for p in candidates
+            ],
+            shuffle=False,
+        )
         started = time.time()
         async for chunk in chain.create_async_generator(
             model=model,

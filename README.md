@@ -79,9 +79,21 @@ con "Sign up and repeat your request"). Tutti gli altri falliscono per cookie,
 API key, browser non-headless o crediti: restano nel catalogo e vengono
 riprovati al probe successivo, senza bisogno di toccare la configurazione.
 
+Due difese che non dipendono dal probe:
+
+* **errori travestiti da contenuto**: alcuni provider gratuiti rispondono
+  `200 OK` con "rate limit"/"Iscriviti e ripeti la richiesta" come testo. Il
+  wrapper li riconosce e li tratta come guasti, quindi il failover prosegue
+  invece di consegnare quel testo al client;
+* **modello per provider**: ai provider legati al proprio catalogo viene passato
+  il loro modello (quello su cui hanno risposto nel probe), cosi' anche loro
+  servono da riserva utile. Al client si presenta il nome modello richiesto.
+
 Knobs utili in `.env`: `G4F_AUTOFREE_PROVIDERS` (blocca una catena fissa),
 `G4F_AUTOFREE_EXCLUDE` (nomi mai usati), `G4F_AUTOFREE_TTL_SECONDS`,
-`G4F_AUTOFREE_PROVIDER_TIMEOUT`, `G4F_AUTOFREE_PROBE_MODEL`.
+`G4F_AUTOFREE_PROVIDER_TIMEOUT` (primo contenuto, default 15s),
+`G4F_AUTOFREE_TOTAL_TIMEOUT` (budget catena, default 75s),
+`G4F_AUTOFREE_PROBE_MODEL`.
 Il file di stato si puo' cancellare in qualsiasi momento: viene ricostruito.
 
 ## Aggiornamenti
